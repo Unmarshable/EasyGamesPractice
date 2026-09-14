@@ -2,6 +2,9 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import "./App.css";
 
 import {
+  DEMO_HIT_FREQUENCY,
+  DEMO_HOUSE_EDGE,
+  DEMO_RTP,
   getOutcomes,
   getRandomOutcome,
   type Outcome,
@@ -23,6 +26,8 @@ function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [playerName, setPlayerName] = useState("");
   const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [balance, setBalance] = useState(1000);
   const [walletBalance, setWalletBalance] = useState(2500);
@@ -57,6 +62,9 @@ function App() {
   const [profileMessage, setProfileMessage] = useState("");
   const [profileError, setProfileError] = useState("");
   const matchPulseTimer = useRef<number | null>(null);
+  const jackpotAnimationFrame = useRef<number | null>(null);
+  const [jackpotCelebration, setJackpotCelebration] = useState<number | null>(null);
+  const [jackpotCelebrationExiting, setJackpotCelebrationExiting] = useState(false);
 
   const outcomes = getOutcomes();
   const isSpinning = spinning.some(Boolean);
@@ -115,9 +123,18 @@ function App() {
     }
 
     try {
-      const response = authMode === "register"
-        ? await api.register(email, password, submittedPlayerName)
-        : await api.login(email, password);
+      if (authMode === "register") {
+        // Registration already creates a session and returns the new account.
+        // Use that response directly instead of making the player sign in again.
+        const response = await api.register(email, password, submittedPlayerName);
+        localStorage.setItem("lucky-spin-token", response.token);
+        applyAccount(response.account);
+        setAuthError("");
+        setAuthenticated(true);
+        return;
+      }
+
+      const response = await api.login(email, password);
       localStorage.setItem("lucky-spin-token", response.token);
       applyAccount(response.account);
       setAuthError("");
@@ -139,6 +156,7 @@ function App() {
     if (matchPulseTimer.current !== null) {
       window.clearInterval(matchPulseTimer.current);
     }
+    if (jackpotAnimationFrame.current !== null) window.cancelAnimationFrame(jackpotAnimationFrame.current);
   }, []);
 
   const flashMatches = (matches: WinningMatch[]) => {
@@ -226,8 +244,14 @@ function App() {
     }
   };
 
-  const spin = async () => {
+  const spin = async (forceJackpot = false) => {
     if (isSpinning) return;
+    if (jackpotCelebration !== null) {
+      setJackpotCelebrationExiting(true);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 420));
+      setJackpotCelebration(null);
+      setJackpotCelebrationExiting(false);
+    }
     if (bet <= 0) {
       setResult("Please enter a valid bet.");
       return;
@@ -251,7 +275,7 @@ function App() {
 
     let spinResponse;
     try {
-      spinResponse = await api.spin(bet, betType);
+      spinResponse = await api.spin(bet, betType, forceJackpot);
     } catch (error) {
       window.clearInterval(interval);
       setSpinning(Array.from({ length: 9 }, () => false));
@@ -275,7 +299,6 @@ function App() {
       window.clearInterval(interval);
       setReels(spinResponse.reels);
       setSpinning(Array.from({ length: 9 }, () => false));
-      setBalance(spinResponse.balance);
       setJackpot(spinResponse.jackpot);
       setFreeSpins(spinResponse.freeSpins);
       setSpins(spinResponse.spins);
@@ -286,11 +309,32 @@ function App() {
       setRoundHistory(spinResponse.roundHistory);
       if (spinResponse.matches.length > 0) {
         flashMatches(spinResponse.matches);
+        if (spinResponse.jackpotWin > 0) {
+          const balanceBeforeJackpot = spinResponse.balance - spinResponse.jackpotWin;
+          const animationDuration = 3200;
+          setBalance(balanceBeforeJackpot);
+          setJackpotCelebration(spinResponse.jackpotWin);
+          setResult("");
+          const startedAt = performance.now();
+          const countUp = (now: number) => {
+            const progress = Math.min(1, (now - startedAt) / animationDuration);
+            const easedProgress = 1 - Math.pow(1 - progress, 3);
+            setBalance(Math.round(balanceBeforeJackpot + spinResponse.jackpotWin * easedProgress));
+            if (progress < 1) {
+              jackpotAnimationFrame.current = window.requestAnimationFrame(countUp);
+            } else {
+              setBalance(spinResponse.balance);
+            }
+          };
+          jackpotAnimationFrame.current = window.requestAnimationFrame(countUp);
+          return;
+        }
+        setBalance(spinResponse.balance);
         const bonusMessage = spinResponse.freeSpins > 0 ? ` ${spinResponse.freeSpins} free spins ready!` : "";
-        const jackpotMessage = spinResponse.jackpotWin > 0 ? ` + jackpot ${formatWager(spinResponse.jackpotWin)}!` : "";
         const matchMessage = spinResponse.matches.map((match) => match.label).join(", ");
-        setResult(`${spinResponse.matches.length} match${spinResponse.matches.length === 1 ? "" : "es"}: ${matchMessage}. Won ${formatWager(spinResponse.winnings)}${bonusMessage}${jackpotMessage}`);
+        setResult(`${spinResponse.matches.length} match${spinResponse.matches.length === 1 ? "" : "es"}: ${matchMessage}. Won ${formatWager(spinResponse.winnings)}${bonusMessage}`);
       } else {
+        setBalance(spinResponse.balance);
         setResult(isFreeSpinRound ? "Free spin complete. No match this time." : `No match. You lost ${formatWager(spinResponse.wager)}.`);
       }
     }, 1900);
@@ -303,10 +347,14 @@ function App() {
       <AuthScreen
         mode={authMode}
         error={authError}
+        email={authEmail}
+        password={authPassword}
         onModeChange={(mode) => {
           setAuthMode(mode);
           setAuthError("");
         }}
+        onEmailChange={setAuthEmail}
+        onPasswordChange={setAuthPassword}
         onSubmit={handleAuth}
       />
     );
@@ -400,12 +448,20 @@ function App() {
               <span>{reel}</span>
             </div>
           ))}
+          {jackpotCelebration !== null && (
+            <div className={`jackpot-celebration ${jackpotCelebrationExiting ? "is-exiting" : ""}`} role="status" aria-live="assertive">
+              <span className="jackpot-celebration-kicker">HOUSE JACKPOT</span>
+              <strong>JACKPOT WIN!</strong>
+              <span className="jackpot-celebration-amount">+{formatWager(jackpotCelebration)}</span>
+              <span className="jackpot-celebration-caption">Credits are being added to your balance</span>
+            </div>
+          )}
         </div>
 
-        <p className={`result ${activeMatches.length > 0 ? "result-win" : ""}`} role="status">
+        {jackpotCelebration === null && <p className={`result ${activeMatches.length > 0 ? "result-win" : ""}`} role="status">
           {result}
-        </p>
-        {activeMatches.length > 0 && (
+        </p>}
+        {jackpotCelebration === null && activeMatches.length > 0 && (
           <div className="match-summary" aria-label="Winning matches">
             {activeMatches.map((match) => (
               <span className="match-chip" key={match.id}>
@@ -415,9 +471,12 @@ function App() {
           </div>
         )}
 
-        <button className="spin-button" onClick={spin} disabled={isSpinning}>
+        <button className="spin-button" onClick={() => spin()} disabled={isSpinning}>
           <span>{isSpinning ? "Spinning" : freeSpins > 0 ? `Use free spin (${freeSpins})` : "Spin the reels"}</span>
           <span className="button-arrow" aria-hidden="true">↗</span>
+        </button>
+        <button className="jackpot-test-button" onClick={() => spin(true)} disabled={isSpinning}>
+          Test house jackpot (demo)
         </button>
 
         <div className="bet-section">
@@ -507,11 +566,11 @@ function App() {
               <h2>All lines live</h2>
               <p className="rail-copy">Every spin checks the full board for connected wins.</p>
               <div className="rail-stats">
-                <div><span>Board</span><strong>3 × 3</strong></div>
-                <div><span>Active lines</span><strong>8</strong></div>
-                <div><span>Bonus lines</span><strong>2</strong></div>
+                <div><span>RTP</span><strong>{DEMO_RTP}%</strong></div>
+                <div><span>Hit rate</span><strong>{DEMO_HIT_FREQUENCY}%</strong></div>
+                <div><span>House edge</span><strong>{DEMO_HOUSE_EDGE}%</strong></div>
               </div>
-              <div className="rail-status"><i aria-hidden="true" /> Live odds are updating</div>
+              <div className="rail-status"><i aria-hidden="true" /> Independent demo outcomes</div>
             </section>
 
             <section className="jackpot-panel" aria-label="Progressive jackpot">
@@ -741,12 +800,20 @@ function Stat({ label, value }: { label: string; value: number }) {
 function AuthScreen({
   mode,
   error,
+  email,
+  password,
   onModeChange,
+  onEmailChange,
+  onPasswordChange,
   onSubmit,
 }: {
   mode: AuthMode;
   error: string;
+  email: string;
+  password: string;
   onModeChange: (mode: AuthMode) => void;
+  onEmailChange: (email: string) => void;
+  onPasswordChange: (password: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   const isRegistering = mode === "register";
@@ -781,8 +848,8 @@ function AuthScreen({
             {isRegistering && (
               <label>Player name<input name="playerName" type="text" placeholder="Your table name" autoComplete="name" /></label>
             )}
-            <label>Email address<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label>
-            <label>Password<div className="auth-password"><input name="password" type="password" placeholder="Minimum 6 characters" autoComplete={isRegistering ? "new-password" : "current-password"} required /><span aria-hidden="true">•••</span></div></label>
+            <label>Email address<input name="email" type="email" value={email} onChange={(event) => onEmailChange(event.target.value)} placeholder="you@example.com" autoComplete="email" required /></label>
+            <label>Password<div className="auth-password"><input name="password" type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} placeholder="Minimum 6 characters" autoComplete={isRegistering ? "new-password" : "current-password"} required /><span aria-hidden="true">•••</span></div></label>
             {isRegistering && <label>Confirm password<input name="confirmPassword" type="password" placeholder="Repeat your password" autoComplete="new-password" required /></label>}
             {isRegistering && <label className="auth-check"><input type="checkbox" required /><span>I agree to the table rules and responsible-play terms.</span></label>}
             {error && <p className="auth-error" role="alert">{error}</p>}
